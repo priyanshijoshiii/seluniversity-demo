@@ -7,7 +7,7 @@ Task:
 4. Deadline: 1 week.
 The corrected file should be attached as part of the PR (Pull Request), not just described in the document.
 
-Response format: markdown-a document with a description:
+Response format: markdown document with a description:
 - Bug #1: a description of how to reproduce, why this is a problem, and a suggested fix.
 - Bug #2: ...
 - etc.
