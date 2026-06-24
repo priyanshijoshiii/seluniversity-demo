@@ -26,31 +26,82 @@ import ConfirmModal from '@/components/ConfirmModal'
 
 const QUICK_EMOJIS = ['❤️', '👍', '😂', '😮', '😢', '🙏', '🔥', '💯', '🎉', '👀']
 
+// bug #5 fix: single source of truth for post length limit
+const MAX_POST_LENGTH = 500
+
+// bug #6 fix: formatters created once, reused on every call
+const formatters = {
+  enTime: new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }),
+  ruTime: new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit' }),
+  enDate: new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }),
+  ruDate: new Intl.DateTimeFormat('ru-RU', { month: 'short', day: 'numeric' }),
+}
+
+// bug #6 fix: single formatTimestamp function, calendar-date comparison, no duplicate
+function formatTimestamp(ts: number, lang: 'ru' | 'en'): string {
+  const safeLang: 'ru' | 'en' = (lang === 'ru' || lang === 'en') ? lang : 'en'
+
+  if (!Number.isFinite(ts)) return ''
+
+  const date = new Date(ts)
+  if (isNaN(date.getTime())) return ''
+
+  const now = new Date()
+
+  try {
+    const isToday =
+      date.getDate() === now.getDate() &&
+      date.getMonth() === now.getMonth() &&
+      date.getFullYear() === now.getFullYear()
+
+    const timeStr = safeLang === 'ru'
+      ? formatters.ruTime.format(date)
+      : formatters.enTime.format(date)
+
+    if (isToday) return timeStr
+
+    const dateStr = safeLang === 'ru'
+      ? formatters.ruDate.format(date)
+      : formatters.enDate.format(date)
+
+    return dateStr + ' · ' + timeStr
+  } catch {
+    return ''
+  }
+}
+
+// bug #1 fix: no dangerouslySetInnerHTML, React elements only, XSS safe
 export function renderContent(content: string, lang?: string) {
   if (!content) return null
-  
-  if (/\*\*|__|~~|`/.test(content)) {
-    const html = content
-      .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
-      .replace(/_(.*?)_/g, '<i>$1</i>')
-      .replace(/~~(.*?)~~/g, '<s>$1</s>')
-      .replace(/`(.*?)`/g, '<code>$1</code>')
-      .replace(/\n/g, '<br/>')
-    
-    return <span dangerouslySetInnerHTML={{ __html: html }} />
-  }
-  
+
+  const parts = content.split(/(\*\*.*?\*\*|~~.*?~~|`.*?`|_.*?_|@[\w-]+|\n)/g)
+
   return (
     <span>
-      {content.split(/(@\w+)/g).map((part, i) => {
-        if (part.startsWith('@') && lang) {
+      {parts.map((part, i) => {
+        if (part.startsWith('**') && part.endsWith('**'))
+          return <b key={i}>{part.slice(2, -2)}</b>
+
+        if (part.startsWith('~~') && part.endsWith('~~'))
+          return <s key={i}>{part.slice(2, -2)}</s>
+
+        if (part.startsWith('`') && part.endsWith('`'))
+          return <code key={i}>{part.slice(1, -1)}</code>
+
+        if (part.startsWith('_') && part.endsWith('_'))
+          return <i key={i}>{part.slice(1, -1)}</i>
+
+        if (part.startsWith('@') && lang)
           return (
-            <NextLink prefetch={false} key={i} href={`/${lang}/profile/${part.slice(1)}`} className="text-blue-500 hover:underline font-medium">
-              {part}{' '}
+            <NextLink key={i} href={`/${lang}/profile/${part.slice(1)}`} className="text-blue-500 hover:underline font-medium">
+              {part}
             </NextLink>
           )
-        }
-        return <span key={i}>{part} </span>
+
+        if (part === '\n') return <br key={i} />
+
+        // plain text: React escapes this automatically, no XSS possible
+        return <span key={i}>{part}</span> // bug 17 fix
       })}
     </span>
   )
@@ -58,8 +109,7 @@ export function renderContent(content: string, lang?: string) {
 
 function htmlToMarkdown(html: string): string {
   let text = html
-  
-  // Заменяем HTML-теги на markdown
+
   text = text.replace(/<b>(.*?)<\/b>/gi, '**$1**')
   text = text.replace(/<strong>(.*?)<\/strong>/gi, '**$1**')
   text = text.replace(/<i>(.*?)<\/i>/gi, '_$1_')
@@ -68,25 +118,94 @@ function htmlToMarkdown(html: string): string {
   text = text.replace(/<strike>(.*?)<\/strike>/gi, '~~$1~~')
   text = text.replace(/<del>(.*?)<\/del>/gi, '~~$1~~')
   text = text.replace(/<code>(.*?)<\/code>/gi, '`$1`')
-  
-  // Заменяем переносы строк
   text = text.replace(/<br\s*\/?>/gi, '\n')
   text = text.replace(/<div>(.*?)<\/div>/gi, '\n$1\n')
   text = text.replace(/<p>(.*?)<\/p>/gi, '\n$1\n')
-  
-  // Убираем оставшиеся HTML-теги и спецсимволы
   text = text.replace(/<[^>]+>/g, '')
   text = text.replace(/&nbsp;/g, ' ')
   text = text.replace(/&amp;/g, '&')
   text = text.replace(/&lt;/g, '<')
   text = text.replace(/&gt;/g, '>')
-  
-  // Убираем множественные переносы и тримим
   text = text.replace(/\n{3,}/g, '\n\n')
   text = text.trim()
-  
+
   return text
 }
+
+// bug #4 fix: moved outside PostComposer, receives props instead of closing over parent scope
+const FormatBar = ({
+  selectionState,
+  applyFormat,
+  isRu
+}: {
+  selectionState: { bold: boolean; italic: boolean; strike: boolean }
+  applyFormat: (command: string, value?: string) => void
+  isRu: boolean
+}) => (
+  <div className="flex items-center gap-0.5">
+    <button
+      type="button"
+      onMouseDown={(e) => { e.preventDefault(); applyFormat('bold') }}
+      className={`p-1.5 rounded-md transition-colors ${selectionState.bold ? 'bg-blue-100 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-white/5'}`}
+      title={isRu ? 'Жирный (Ctrl+B)' : 'Bold (Ctrl+B)'}
+    >
+      <Bold className="h-3.5 w-3.5" />
+    </button>
+    <button
+      type="button"
+      onMouseDown={(e) => { e.preventDefault(); applyFormat('italic') }}
+      className={`p-1.5 rounded-md transition-colors ${selectionState.italic ? 'bg-blue-100 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-white/5'}`}
+      title={isRu ? 'Курсив (Ctrl+I)' : 'Italic (Ctrl+I)'}
+    >
+      <Italic className="h-3.5 w-3.5" />
+    </button>
+    <button
+      type="button"
+      onMouseDown={(e) => { e.preventDefault(); applyFormat('strikeThrough') }}
+      className={`p-1.5 rounded-md transition-colors ${selectionState.strike ? 'bg-blue-100 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-white/5'}`}
+      title={isRu ? 'Зачёркнутый (Ctrl+Shift+X)' : 'Strikethrough (Ctrl+Shift+X)'}
+    >
+      <Strikethrough className="h-3.5 w-3.5" />
+    </button>
+    <button
+      type="button"
+      onMouseDown={(e) => { e.preventDefault(); applyFormat('fontName', 'monospace') }}
+      className="p-1.5 rounded-md text-gray-400 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+      title={isRu ? 'Моноширинный (Ctrl+E)' : 'Monospace (Ctrl+E)'}
+    >
+      <Code className="h-3.5 w-3.5" />
+    </button>
+  </div>
+)
+
+// bug #3 fix: moved outside PostComposer, stable reference, no remounting on every keystroke
+const EditorContent = ({
+  editorRef,
+  onInput,
+  onFocus,
+  onBlur,
+  onKeyDown,
+  isRu
+}: {
+  editorRef: React.RefObject<HTMLDivElement>
+  onInput: () => void
+  onFocus: () => void
+  onBlur: () => void
+  onKeyDown: (e: React.KeyboardEvent) => void
+  isRu: boolean
+}) => (
+  <div
+    ref={editorRef}
+    contentEditable
+    suppressContentEditableWarning
+    onInput={onInput}
+    onFocus={onFocus}
+    onBlur={onBlur}
+    onKeyDown={onKeyDown}
+    data-placeholder={isRu ? 'Поделитесь прогрессом... Используйте @username для упоминаний!' : 'Share your progress... Use @username to mention!'}
+    className="w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-900 placeholder-gray-400 focus:border-blue-500 focus:outline-none dark:border-white/10 dark:bg-white/5 dark:text-white min-h-[80px] empty:before:content-[attr(data-placeholder)] empty:before:text-gray-400 dark:empty:before:text-white/20"
+  />
+)
 
 export function PostComposer({ 
   onPost, 
@@ -138,7 +257,6 @@ export function PostComposer({
     }
   }, [])
 
-  // Синхронизация markdown -> HTML при загрузке
   useEffect(() => {
     if (content && editorRef.current && !editorRef.current.isSameNode(document.activeElement)) {
       const html = content
@@ -153,7 +271,6 @@ export function PostComposer({
     }
   }, [content])
 
-  // Синхронизация при переключении fullscreen
   useEffect(() => {
     if (fullscreen && fullscreenEditorRef.current && editorRef.current) {
       fullscreenEditorRef.current.innerHTML = editorRef.current.innerHTML
@@ -164,7 +281,6 @@ export function PostComposer({
   const createPost = useMutation(api.posts.createPost)
   const createPoll = useMutation(api.polls.create)
   const inventory = useQuery(api.shop.getInventory, user ? { clerkId: user.id } : 'skip')
-  const allItems = useQuery(api.shop.getItems)
   const canPostQuery = useQuery(api.posts.canCreatePost, user ? {} : 'skip')
 
   const equippedItems = inventory?.filter(i => i.equipped) || []
@@ -173,7 +289,6 @@ export function PostComposer({
   const hasClaude = equippedItems.some(i => i.itemSlug === 'anon-mask-claude')
   const hasMicrophone = equippedItems.some(i => i.itemSlug === 'microphone')
 
-  // Отслеживание состояния форматирования
   const updateSelectionState = useCallback(() => {
     setSelectionState({
       bold: document.queryCommandState('bold'),
@@ -193,8 +308,6 @@ export function PostComposer({
     ref.focus()
     document.execCommand(command, false, value)
     updateSelectionState()
-    
-    // Сохраняем контент
     const html = ref.innerHTML
     const text = htmlToMarkdown(html)
     updateContent(text)
@@ -218,7 +331,8 @@ export function PostComposer({
   }
 
   const handlePost = async () => {
-    if (!user || !content.trim() || isPosting || postCooldownSeconds > 0) return
+    // bug #5 fix:  enforce MAX_POST_LENGTH before sending
+    if (!user || !content.trim() || isPosting || postCooldownSeconds > 0 || content.length > MAX_POST_LENGTH) return
 
     if (canPostQuery && !canPostQuery.canPost) {
       const seconds = canPostQuery.remainingSeconds
@@ -230,7 +344,8 @@ export function PostComposer({
 
     setIsPosting(true)
     const contentToSend = content.trim()
-    const mentions = content.match(/@(\w+)/g)?.map((m) => m.slice(1)) || []
+    // bug #15 fix: updated regex to support hyphenated usernames
+    const mentions = content.match(/@([\w-]+)/g)?.map((m) => m.slice(1)) || []
 
     try {
       const postId = await createPost({
@@ -285,82 +400,44 @@ export function PostComposer({
           }, 1000)
         }
       } else {
-        alert(isRu ? 'Не удалось создать пост: ' : 'Failed to create post: ' + (error.message || 'Unknown error'))
+        // bug #7 fix: operator precedence fixed, both languages get error detail
+        const errorMessage = error.message || 'Unknown error'
+        alert(isRu ? `Не удалось создать пост: ${errorMessage}` : `Failed to create post: ${errorMessage}`)
       }
     } finally {
       setIsPosting(false)
     }
   }
 
-  const FormatBar = () => (
-    <div className="flex items-center gap-0.5">
-      <button
-        type="button"
-        onMouseDown={(e) => { e.preventDefault(); applyFormat('bold') }}
-        className={`p-1.5 rounded-md transition-colors ${selectionState.bold ? 'bg-blue-100 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-white/5'}`}
-        title={isRu ? 'Жирный (Ctrl+B)' : 'Bold (Ctrl+B)'}
-      >
-        <Bold className="h-3.5 w-3.5" />
-      </button>
-      <button
-        type="button"
-        onMouseDown={(e) => { e.preventDefault(); applyFormat('italic') }}
-        className={`p-1.5 rounded-md transition-colors ${selectionState.italic ? 'bg-blue-100 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-white/5'}`}
-        title={isRu ? 'Курсив (Ctrl+I)' : 'Italic (Ctrl+I)'}
-      >
-        <Italic className="h-3.5 w-3.5" />
-      </button>
-      <button
-        type="button"
-        onMouseDown={(e) => { e.preventDefault(); applyFormat('strikeThrough') }}
-        className={`p-1.5 rounded-md transition-colors ${selectionState.strike ? 'bg-blue-100 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-white/5'}`}
-        title={isRu ? 'Зачёркнутый (Ctrl+Shift+X)' : 'Strikethrough (Ctrl+Shift+X)'}
-      >
-        <Strikethrough className="h-3.5 w-3.5" />
-      </button>
-      <button
-        type="button"
-        onMouseDown={(e) => { e.preventDefault(); applyFormat('fontName', 'monospace') }}
-        className="p-1.5 rounded-md text-gray-400 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
-        title={isRu ? 'Моноширинный (Ctrl+E)' : 'Monospace (Ctrl+E)'}
-      >
-        <Code className="h-3.5 w-3.5" />
-      </button>
-    </div>
-  )
-
-  const EditorContent = () => (
-    <div
-      ref={editorRef}
-      contentEditable
-      suppressContentEditableWarning
-      onInput={handleEditorInput}
-      onFocus={() => setIsFocused(true)}
-      onBlur={() => { setIsFocused(false); handleEditorInput() }}
-      onKeyDown={(e) => {
-        if ((e.ctrlKey || e.metaKey) && e.key === 'b') { e.preventDefault(); applyFormat('bold') }
-        if ((e.ctrlKey || e.metaKey) && e.key === 'i') { e.preventDefault(); applyFormat('italic') }
-        if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'X') { e.preventDefault(); applyFormat('strikeThrough') }
-        if ((e.ctrlKey || e.metaKey) && e.key === 'e') { e.preventDefault(); applyFormat('fontName', 'monospace') }
-      }}
-      data-placeholder={isRu ? 'Поделитесь прогрессом... Используйте @username для упоминаний!' : 'Share your progress... Use @username to mention!'}
-      className="w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-900 placeholder-gray-400 focus:border-blue-500 focus:outline-none dark:border-white/10 dark:bg-white/5 dark:text-white min-h-[80px] empty:before:content-[attr(data-placeholder)] empty:before:text-gray-400 dark:empty:before:text-white/20"
-    />
-  )
-
   return (
     <>
-      {/* Обычный редактор */}
       {!fullscreen && (
         <div className="rounded-2xl border border-gray-200 bg-white p-4 dark:border-white/5 dark:bg-white/[0.01]" style={{ display: !inModal && keyboardOpen ? 'none' : 'block' }}>
           <div className="flex items-start gap-3">
             <img src={user?.imageUrl || ''} className="h-10 w-10 rounded-full flex-shrink-0" alt="" />
             <div className="flex-1 min-w-0">
-              <EditorContent />
+              {/* bug #3 fix: EditorContent moved outside, stable reference */}
+              <EditorContent
+                editorRef={editorRef}
+                onInput={handleEditorInput}
+                onFocus={() => setIsFocused(true)}
+                onBlur={() => { setIsFocused(false); handleEditorInput() }}
+                onKeyDown={(e) => {
+                  if ((e.ctrlKey || e.metaKey) && e.key === 'b') { e.preventDefault(); applyFormat('bold') }
+                  if ((e.ctrlKey || e.metaKey) && e.key === 'i') { e.preventDefault(); applyFormat('italic') }
+                  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'X') { e.preventDefault(); applyFormat('strikeThrough') }
+                  if ((e.ctrlKey || e.metaKey) && e.key === 'e') { e.preventDefault(); applyFormat('fontName', 'monospace') }
+                }}
+                isRu={isRu}
+              />
               
-              {/* Format bar */}
               <div className="flex items-center justify-between mt-2">
-                <FormatBar />
+                {/* bug #4 fix: FormatBar moved outside, receives props */}
+                <FormatBar
+                  selectionState={selectionState}
+                  applyFormat={applyFormat}
+                  isRu={isRu}
+                />
                 <button
                   type="button"
                   onClick={() => setFullscreen(true)}
@@ -422,7 +499,8 @@ export function PostComposer({
                   <BarChart3 className="h-4 w-4" />
                 </button>
                 <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-gray-400">{content.length} / 500</span>
+                  {/* bug #5 fix: consistent limit shown */}
+                  <span className="text-[11px] text-gray-400">{content.length} / {MAX_POST_LENGTH}</span>
                   <button 
                     onClick={handlePost} 
                     disabled={!content.trim() || isPosting || postCooldownSeconds > 0}
@@ -455,7 +533,6 @@ export function PostComposer({
         </div>
       )}
 
-      {/* Полноэкранный редактор */}
       <AnimatePresence>
         {fullscreen && (
           <motion.div
@@ -464,7 +541,6 @@ export function PostComposer({
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 flex flex-col bg-white dark:bg-[#0a0a0f]"
           >
-            {/* Header */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-white/5 flex-shrink-0">
               <div className="flex items-center gap-3">
                 <button
@@ -494,7 +570,6 @@ export function PostComposer({
               </button>
             </div>
 
-            {/* Editor area */}
             <div className="flex-1 overflow-y-auto">
               <div className="max-w-2xl mx-auto px-4 py-4">
                 <div className="flex items-start gap-3 mb-4">
@@ -546,11 +621,15 @@ export function PostComposer({
               </div>
             </div>
 
-            {/* Bottom toolbar */}
             <div className="border-t border-gray-200 dark:border-white/5 px-4 py-3 flex-shrink-0">
               <div className="max-w-2xl mx-auto flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <FormatBar />
+                  {/* bug #4 fix: FormatBar with props */}
+                  <FormatBar
+                    selectionState={selectionState}
+                    applyFormat={applyFormat}
+                    isRu={isRu}
+                  />
                   <div className="w-px h-5 bg-gray-200 dark:bg-white/10 mx-1" />
                   <button onClick={() => setShowPoll(!showPoll)} className={`p-1.5 rounded-md transition-colors ${showPoll ? 'bg-purple-100 text-purple-600 dark:bg-purple-500/20 dark:text-purple-400' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-white/5'}`} title={isRu ? 'Добавить опрос' : 'Add poll'}>
                     <BarChart3 className="h-4 w-4" />
@@ -565,14 +644,14 @@ export function PostComposer({
                     <button onClick={() => setUseMask(useMask === 'anon-mask-claude' ? null : 'anon-mask-claude')} className={`rounded-full px-3 py-1 text-xs font-semibold transition-all ${useMask === 'anon-mask-claude' ? 'bg-purple-500 text-white' : 'bg-gray-100 text-gray-500 hover:bg-purple-100 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10'}`}>🤖</button>
                   )}
                 </div>
-                <span className="text-[11px] text-gray-400">{content.length} / 1500</span>
+                {/* bug #5 fix: consistent limit in fullscreen */}
+                <span className="text-[11px] text-gray-400">{content.length} / {MAX_POST_LENGTH}</span>
               </div>
             </div>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Стили для редактора */}
       <style jsx global>{`
         [data-placeholder]:empty:before {
           content: attr(data-placeholder);
@@ -626,12 +705,7 @@ function CommentItem({ comment, isReply, lang, onReply, onDelete, onToggleReacti
   const reactions = useQuery(api.reactions.getPostCommentReactions, { commentId: comment._id }) || []
   const isRu = lang === 'ru'
 
-  function formatTimestamp(ts: number, lang: string): string {
-    const date = new Date(ts); const now = new Date(); const diff = now.getTime() - date.getTime(); const hours = Math.floor(diff / 3600000)
-    if (hours < 24) { if (lang === 'ru') return date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }) }
-    if (lang === 'ru') return date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }) + ' ' + date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
-    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' + date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })
-  }
+  // bug #6 fix: formatTimestamp removed from here, using the single shared function above
 
   const handleQuickReaction = (emoji: string) => {
     onToggleReaction(comment._id, emoji)
@@ -645,12 +719,29 @@ function CommentItem({ comment, isReply, lang, onReply, onDelete, onToggleReacti
       ) : comment.authorAvatar && comment.authorAvatar.length <= 4 ? (
         <span className="text-lg flex-shrink-0 mt-0.5">{comment.authorAvatar}</span>
       ) : (
-        <img src={comment.authorAvatar} className="h-6 w-6 rounded-full mt-0.5 object-cover" alt="" />
+        // bug #13 fix: fallback for broken or empty avatar
+        comment.authorAvatar ? (
+          <img
+            src={comment.authorAvatar}
+            className="h-6 w-6 rounded-full mt-0.5 object-cover"
+            alt=""
+            onError={(e) => { e.currentTarget.style.display = 'none' }}
+          />
+        ) : (
+          <div className="h-6 w-6 rounded-full mt-0.5 bg-gray-200 dark:bg-white/10 flex-shrink-0" />
+        )
       )}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1.5 flex-wrap">
-          {comment.authorUsername === 'anonymous' ? <span className="text-xs font-semibold text-gray-900 dark:text-white">{comment.authorName}</span> : <NextLink prefetch={false} href={`/${lang}/profile/${comment.authorUsername}`} onClick={(e) => e.stopPropagation()} className="text-xs font-semibold text-gray-900 dark:text-white hover:text-blue-500">@{comment.authorUsername}</NextLink>}
-          <span className="text-[10px] text-gray-400">{formatTimestamp(comment.createdAt, lang)}</span>
+          {comment.authorUsername === 'anonymous' ? (
+            <span className="text-xs font-semibold text-gray-900 dark:text-white">{comment.authorName}</span>
+          ) : (
+            <NextLink prefetch={false} href={`/${lang}/profile/${comment.authorUsername}`} onClick={(e) => e.stopPropagation()} className="text-xs font-semibold text-gray-900 dark:text-white hover:text-blue-500">
+              @{comment.authorUsername}
+            </NextLink>
+          )}
+          {/* bug #6 fix: cast to satisfy TypeScript, runtime validated inside formatTimestamp */}
+          <span className="text-[10px] text-gray-400">{formatTimestamp(comment.createdAt, lang as 'ru' | 'en')}</span>
         </div>
         <p className="text-xs text-gray-600 dark:text-white/60 mt-0.5">{comment.content}</p>
         <div className="flex items-center gap-2 mt-1 relative cursor-pointer" onClick={() => setShowPicker(!showPicker)}>
@@ -675,7 +766,7 @@ function CommentItem({ comment, isReply, lang, onReply, onDelete, onToggleReacti
                 className="absolute bottom-full left-0 mb-2 z-50 bg-white dark:bg-gray-800 rounded-2xl shadow-xl border border-gray-200 dark:border-white/10 p-1.5 flex"
                 onClick={(e) => e.stopPropagation()}
               >
-                <div 
+                <div
                   className="flex gap-1 overflow-x-auto whitespace-nowrap scroll-smooth w-[140px] overscroll-x-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
                   style={{ touchAction: 'pan-x' }}
                 >
@@ -721,6 +812,8 @@ export function PostCard({
   const [showComments, setShowComments] = useState(false)
   const [showReactionPicker, setShowReactionPicker] = useState(false)
   const [showRepostToast, setShowRepostToast] = useState(false)
+  // bug #8 fix: track reposting state to prevent duplicate requests
+  const [isReposting, setIsReposting] = useState(false)
   const { content: commentText, updateContent: setCommentText, clearDraft: clearCommentDraft } = useDraft(`comment-post-${post?._id}`, 'comment')
   const [replyTo, setReplyTo] = useState<Id<'postComments'> | null>(null)
   const { content: replyText, updateContent: setReplyText, clearDraft: clearReplyDraft } = useDraft(`reply-post-${post?._id}`, 'comment')
@@ -749,40 +842,74 @@ export function PostCard({
 
   if (!post || !post._id) return null
 
-  function formatTimestamp(ts: number, lang: string): string {
-    const date = new Date(ts); const now = new Date(); const diff = now.getTime() - date.getTime(); const hours = Math.floor(diff / 3600000)
-    if (hours < 24) { if (lang === 'ru') return date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }) }
-    if (lang === 'ru') return date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }) + ' ' + date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
-    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' + date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })
-  }
+  // bug #6 fix: formatTimestamp removed from here, using the single shared function above
 
   const handlePin = () => user && togglePin({ postId: post._id })
   const handleDelete = () => setDeleteConfirm('post')
-  const handleBookmark = () => { if (!user) return; toggleBookmark({ postId: post._id, postContent: post.content?.slice(0, 100) || '', postAuthorName: post.authorName || '', postAuthorUsername: post.authorUsername || '' }) }
-  
-  const handleRepost = async () => {
+  const handleBookmark = () => {
     if (!user) return
-    await createPost({
-      authorId: user.id,
-      authorName: user.fullName || 'User',
-      authorAvatar: user.imageUrl || '',
-      authorUsername: user.username || '',
-      content: `🔄 ${isRu ? 'Репост от' : 'Repost from'} @${post.authorUsername}:\n\n${post.content}`,
-      mentions: [post.authorUsername],
-      tags: post.tags || [],
+    toggleBookmark({
+      postId: post._id,
+      postContent: post.content?.slice(0, 100) || '',
+      postAuthorName: post.authorName || '',
+      postAuthorUsername: post.authorUsername || ''
     })
-    setShowRepostToast(true)
-    setTimeout(() => setShowRepostToast(false), 2500)
+  }
+  
+  // bug #8 + #10 fix: rate limiting and content length check
+  const handleRepost = async () => {
+    if (!user || isReposting) return
+    setIsReposting(true)
+    try {
+      const prefix = `🔄 ${isRu ? 'Репост от' : 'Repost from'} @${post.authorUsername}:\n\n`
+      const trimmedContent = post.content.slice(0, MAX_POST_LENGTH - prefix.length)
+      await createPost({
+        authorId: user.id,
+        authorName: user.fullName || 'User',
+        authorAvatar: user.imageUrl || '',
+        authorUsername: user.username || '',
+        content: prefix + trimmedContent,
+        mentions: [post.authorUsername],
+        tags: post.tags || [],
+      })
+      setShowRepostToast(true)
+      setTimeout(() => setShowRepostToast(false), 2500)
+    } finally {
+      setIsReposting(false)
+    }
   }
 
-  const handleComment = async (parentId?: Id<'postComments'>) => { if (!user) return; const c = parentId ? replyText : commentText; if (!c.trim()) return; await createComment({ postId: post._id, content: c.trim(), parentCommentId: parentId }); if (parentId) { setReplyText(''); clearReplyDraft(); setReplyTo(null) } else { setCommentText(''); clearCommentDraft() } }
+  const handleComment = async (parentId?: Id<'postComments'>) => {
+    if (!user) return
+    const c = parentId ? replyText : commentText
+    if (!c.trim()) return
+    await createComment({ postId: post._id, content: c.trim(), parentCommentId: parentId })
+    if (parentId) {
+      setReplyText('')
+      clearReplyDraft()
+      setReplyTo(null)
+    } else {
+      setCommentText('')
+      clearCommentDraft()
+    }
+  }
   
   const handleDeleteComment = (id: Id<'postComments'>) => {
     setCommentToDelete(id)
     setDeleteConfirm('comment')
   }
   
-  const handleShare = () => navigator.clipboard.writeText(`${window.location.origin}/${lang}/posts/${post._id}`)
+  // bug #11 fix: check clipboard exists, handle success and failure
+  const handleShare = () => {
+    if (!navigator.clipboard) {
+      alert(isRu ? 'Буфер обмена недоступен' : 'Clipboard not available')
+      return
+    }
+    navigator.clipboard
+      .writeText(`${window.location.origin}/${lang}/posts/${post._id}`)
+      .then(() => alert(isRu ? 'Ссылка скопирована' : 'Link copied!'))
+      .catch(() => alert(isRu ? 'Не удалось скопировать' : 'Failed to copy link'))
+  }
 
   const handleQuickReaction = (emoji: string) => {
     togglePostReaction({ postId: post._id, emoji })
@@ -795,8 +922,16 @@ export function PostCard({
         <NextLink prefetch={false} href={`/${lang}/profile/${post.authorUsername}`} onClick={(e) => e.stopPropagation()}>
           {post.authorId === user?.id && user?.imageUrl ? (
             <img src={user.imageUrl} className="h-10 w-10 rounded-full hover:ring-2 ring-purple-500 transition-all object-cover" alt="" />
+          ) : post.authorAvatar ? (
+            // bug #16 fix: fallback for broken or empty post avatar
+            <img
+              src={post.authorAvatar}
+              className="h-10 w-10 rounded-full hover:ring-2 ring-purple-500 transition-all object-cover"
+              alt=""
+              onError={(e) => { e.currentTarget.style.display = 'none' }}
+            />
           ) : (
-            <img src={post.authorAvatar} className="h-10 w-10 rounded-full hover:ring-2 ring-purple-500 transition-all object-cover" alt="" />
+            <div className="h-10 w-10 rounded-full bg-gray-200 dark:bg-white/10 flex-shrink-0" />
           )}
         </NextLink>
         <div className="flex-1 min-w-0">
@@ -808,34 +943,36 @@ export function PostCard({
                 @{post.authorUsername}
               </NextLink>
             )}
-            <span className="text-xs text-gray-400">{formatTimestamp(post.createdAt, lang)}</span>
+            {/* bug #6 fix: cast to satisfy TypeScript */}
+            <span className="text-xs text-gray-400">{formatTimestamp(post.createdAt, lang as 'ru' | 'en')}</span>
             {post.globallyPinned && <Pin className="h-3 w-3 text-yellow-500 fill-current" />}
             {post.isPinned && !post.globallyPinned && <Pin className="h-3 w-3 text-gray-400" />}
           </div>
-          
-        
-          <NextLink prefetch={false} href={`/${lang}/posts/${post._id}`} className="block mt-2">
-           <div className="text-sm text-gray-700 dark:text-white/60 whitespace-pre-wrap">
-  {renderContent(post.content, lang)}
-</div>  </NextLink>
 
-            {polls && polls.length > 0 && polls.map((poll: any) => (
+          <NextLink prefetch={false} href={`/${lang}/posts/${post._id}`} className="block mt-2">
+            <div className="text-sm text-gray-700 dark:text-white/60 whitespace-pre-wrap">
+              {renderContent(post.content, lang)}
+            </div>
+          </NextLink>
+
+          {polls && polls.length > 0 && polls.map((poll: any) => (
             <div key={poll._id} className="mt-2">
               <PollCard poll={poll} />
             </div>
           ))}
 
-
           {post.tags?.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-1.5">
-              {post.tags.map((t: string) => <NextLink prefetch={false} key={t} href={`/${lang}/trends?topic=${t}`} className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-600 dark:bg-blue-500/10 dark:text-blue-400 hover:bg-blue-100">#{t}</NextLink>)}
+              {post.tags.map((t: string) => (
+                <NextLink prefetch={false} key={t} href={`/${lang}/trends?topic=${t}`} className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-600 dark:bg-blue-500/10 dark:text-blue-400 hover:bg-blue-100">#{t}</NextLink>
+              ))}
             </div>
           )}
         </div>
       </div>
 
-      <div 
-        className="mt-3 flex items-center border-t border-gray-100 pt-3 dark:border-white/5 relative cursor-pointer" 
+      <div
+        className="mt-3 flex items-center border-t border-gray-100 pt-3 dark:border-white/5 relative cursor-pointer"
         onClick={(e) => {
           const isReactionButton = (e.target as HTMLElement).closest('[data-reaction-btn]')
           if (!isReactionButton) {
@@ -849,7 +986,13 @@ export function PostCard({
             <MessageCircle className="h-4 w-4" />
             <span className="text-xs font-semibold">{post.commentCount}</span>
           </button>
-          <button onClick={(e) => { e.stopPropagation(); handleRepost() }} className="text-gray-400 hover:text-green-500 transition-colors" title={isRu ? 'Репост' : 'Repost'}>
+          {/* bug #8 fix: disabled while reposting */}
+          <button
+            disabled={isReposting}
+            onClick={(e) => { e.stopPropagation(); handleRepost() }}
+            className="text-gray-400 hover:text-green-500 transition-colors disabled:opacity-50"
+            title={isRu ? 'Репост' : 'Repost'}
+          >
             <Repeat2 className="h-4 w-4" />
           </button>
           <button onClick={(e) => { e.stopPropagation(); handleShare() }} className="text-gray-400 hover:text-blue-500 transition-colors" title={isRu ? 'Поделиться' : 'Share'}>
@@ -879,7 +1022,7 @@ export function PostCard({
               className="absolute bottom-full left-0 mb-2 z-50 bg-white dark:bg-gray-800 rounded-2xl shadow-xl border border-gray-200 dark:border-white/10 p-1.5 flex"
               onClick={(e) => e.stopPropagation()}
             >
-              <div 
+              <div
                 className="flex gap-1 overflow-x-auto whitespace-nowrap scroll-smooth w-[140px] overscroll-x-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
                 style={{ touchAction: 'pan-x' }}
               >
@@ -906,8 +1049,8 @@ export function PostCard({
               <CommentItem comment={c} isReply={false} lang={lang} onReply={id => setReplyTo(replyTo === id ? null : id)} onDelete={handleDeleteComment} onToggleReaction={(id, emoji) => toggleCommentReaction({ commentId: id, emoji })} />
               {replyTo === c._id && (
                 <div className="flex items-center gap-2 mt-2 mb-3 ml-6 pl-4 border-l-2 border-gray-200 dark:border-white/10 relative">
-                  <input 
-                    value={replyText} 
+                  <input
+                    value={replyText}
                     onChange={(e) => {
                       if (e.target.value.length <= 300) setReplyText(e.target.value)
                       const val = e.target.value
@@ -923,10 +1066,10 @@ export function PostCard({
                         }
                       }
                       setShowReplyMentions(false)
-                    }} 
+                    }}
                     maxLength={300}
-                    placeholder={isRu ? 'Написать ответ... @username' : 'Write a reply... @username'} 
-                    className="flex-1 rounded-lg border border-gray-200 bg-gray-50 px-2 py-1 text-xs dark:bg-white/5 dark:text-white" 
+                    placeholder={isRu ? 'Написать ответ... @username' : 'Write a reply... @username'}
+                    className="flex-1 rounded-lg border border-gray-200 bg-gray-50 px-2 py-1 text-xs dark:bg-white/5 dark:text-white"
                   />
                   {showReplyMentions && searchedUsers && searchedUsers.length > 0 && (
                     <div className="absolute bottom-full left-0 mb-1 w-40 bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-gray-200 dark:border-white/10 overflow-hidden z-50">
@@ -949,12 +1092,14 @@ export function PostCard({
                   <button onClick={() => handleComment(c._id)} className="rounded-lg p-1.5 text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-all"><Send className="h-3.5 w-3.5" /></button>
                 </div>
               )}
-              {comments?.filter((r: any) => r.parentCommentId === c._id).map((r: any) => <CommentItem key={r._id} comment={r} isReply={true} lang={lang} onReply={() => {}} onDelete={handleDeleteComment} onToggleReaction={(id, emoji) => toggleCommentReaction({ commentId: id, emoji })} />)}
+              {comments?.filter((r: any) => r.parentCommentId === c._id).map((r: any) => (
+                <CommentItem key={r._id} comment={r} isReply={true} lang={lang} onReply={() => {}} onDelete={handleDeleteComment} onToggleReaction={(id, emoji) => toggleCommentReaction({ commentId: id, emoji })} />
+              ))}
             </div>
           ))}
           <div className="flex items-center gap-2 mt-3 relative">
-            <input 
-              value={commentText} 
+            <input
+              value={commentText}
               onChange={(e) => {
                 if (e.target.value.length <= 300) setCommentText(e.target.value)
                 const val = e.target.value
@@ -970,10 +1115,10 @@ export function PostCard({
                   }
                 }
                 setShowMentions(false)
-              }} 
+              }}
               maxLength={300}
-              placeholder={isRu ? 'Написать комментарий... @username' : 'Write a comment... @username'} 
-              className="flex-1 rounded-xl border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs focus:outline-none dark:bg-white/5 dark:text-white" 
+              placeholder={isRu ? 'Написать комментарий... @username' : 'Write a comment... @username'}
+              className="flex-1 rounded-xl border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs focus:outline-none dark:bg-white/5 dark:text-white"
             />
             <span className="text-[10px] text-gray-400 flex-shrink-0">{commentText.length}/300</span>
             {showMentions && searchedUsers && searchedUsers.length > 0 && (
@@ -1045,3 +1190,4 @@ export function PostCard({
 export default function PostCardDefault({ post, showPin = false }: { post: any; showPin?: boolean }) {
   return <PostCard post={post} showPin={showPin} />
 }
+
